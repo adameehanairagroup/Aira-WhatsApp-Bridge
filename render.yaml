@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: aira-founder-desk
+    env: node
+    plan: free
+    buildCommand: "npm install"
+    startCommand: "node index.js"
+    envVars:
+      - key: NODE_VERSION
+        value: 20.0.0
+      - key: FOUNDER_PHONE
+        value: "918921584368"
+      - key: AIRA_API_URL
+        value: "https://airaai-8ibs.onrender.com/v1/chat/completions"
