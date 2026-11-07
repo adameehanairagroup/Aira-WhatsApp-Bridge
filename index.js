@@ -1,5 +1,5 @@
 /**
- * 🚀 Sovereign AIRA Founder Desk & WhatsApp Bridge v2.0
+ * 🚀 Sovereign AIRA Founder Desk & WhatsApp Bridge v2.1
  * Engineered by Er. Adam Eehan (Founder & CEO, Aira Group of Technology)
  * Connects airaaigroup.in live visitors directly to Founder's personal WhatsApp (+91 8921 584 368)
  * With Sovereign Aira 3 Ultra Multilingual AI Co-Pilot Fallback
@@ -10,6 +10,7 @@ const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const QRCode = require('qrcode');
 const pino = require('pino');
 const { Boom } = require('@hapi/boom');
 const {
@@ -44,7 +45,9 @@ if (!fs.existsSync(CONFIG.SESSION_DIR)) {
 let sock = null;
 let isConnected = false;
 let currentPairingCode = null;
-let pairingRequested = false;
+let currentQrDataUrl = null;
+let codeGeneratedAt = 0;
+let isGeneratingCode = false;
 const startTime = Date.now();
 
 // Desk Modes: 'ACTIVE' (60s timer for Boss) | 'OFFLINE' (0s instant AI)
@@ -84,9 +87,7 @@ function getUptime() {
 function sanitizeAiResponse(text) {
     if (!text) return "";
     let clean = text.trim();
-    // Remove consecutive word repetitions (e.g. "finish finish finish finish")
     clean = clean.replace(/(\b[\w'-]+\b)(?:\s+\1){2,}/gi, '$1');
-    // Remove consecutive phrase repetitions
     clean = clean.replace(/(.{8,40}?)(?:\s*\1){2,}/gi, '$1');
     return clean.trim();
 }
@@ -167,6 +168,91 @@ Strict Directives:
 }
 
 // ----------------------------------------------------
+// 🔑 DYNAMIC PAIRING CODE REGENERATOR
+// ----------------------------------------------------
+async function getOrGeneratePairingCode(forceRefresh = false) {
+    if (isConnected) return { connected: true, message: "WhatsApp is already connected!" };
+
+    const now = Date.now();
+    const age = now - codeGeneratedAt;
+
+    // Reuse existing code if younger than 110s and not forcing refresh
+    if (!forceRefresh && currentPairingCode && age < 110000) {
+        return {
+            connected: false,
+            pairingCode: currentPairingCode,
+            phone: CONFIG.FOUNDER_PHONE,
+            qr: currentQrDataUrl,
+            remainingSeconds: Math.max(0, Math.round((120000 - age) / 1000))
+        };
+    }
+
+    if (isGeneratingCode) {
+        // Return existing while generating
+        return {
+            connected: false,
+            pairingCode: currentPairingCode || "GENERATING...",
+            phone: CONFIG.FOUNDER_PHONE,
+            qr: currentQrDataUrl,
+            remainingSeconds: 60
+        };
+    }
+
+    isGeneratingCode = true;
+    try {
+        if (!sock || !sock.ws || sock.ws.readyState !== 1) {
+            await startWhatsAppBridge();
+            await delay(3000);
+        }
+
+        if (sock && !sock.authState.creds.registered) {
+            console.log(`📲 Requesting FRESH 8-digit pairing code for +${CONFIG.FOUNDER_PHONE}...`);
+            const code = await sock.requestPairingCode(CONFIG.FOUNDER_PHONE);
+            currentPairingCode = code;
+            codeGeneratedAt = Date.now();
+            console.log(`🔑 NEW ACTIVE PAIRING CODE: ${code}`);
+            isGeneratingCode = false;
+            return {
+                connected: false,
+                pairingCode: code,
+                phone: CONFIG.FOUNDER_PHONE,
+                qr: currentQrDataUrl,
+                remainingSeconds: 120
+            };
+        }
+    } catch (err) {
+        console.warn(`Pairing code request retry: ${err.message}`);
+        try {
+            await startWhatsAppBridge();
+            await delay(3500);
+            if (sock && !sock.authState.creds.registered) {
+                const code = await sock.requestPairingCode(CONFIG.FOUNDER_PHONE);
+                currentPairingCode = code;
+                codeGeneratedAt = Date.now();
+                isGeneratingCode = false;
+                return {
+                    connected: false,
+                    pairingCode: code,
+                    phone: CONFIG.FOUNDER_PHONE,
+                    qr: currentQrDataUrl,
+                    remainingSeconds: 120
+                };
+            }
+        } catch (e2) {
+            console.error(`Fatal pairing error: ${e2.message}`);
+        }
+    }
+    isGeneratingCode = false;
+    return {
+        connected: false,
+        pairingCode: currentPairingCode || "WAITING...",
+        phone: CONFIG.FOUNDER_PHONE,
+        qr: currentQrDataUrl,
+        remainingSeconds: 30
+    };
+}
+
+// ----------------------------------------------------
 // 🌐 EXPRESS WEB & API SERVER (For Render & Website)
 // ----------------------------------------------------
 const app = express();
@@ -185,24 +271,11 @@ app.get('/health', (req, res) => {
     });
 });
 
-// Pairing Code Endpoint
+// Dynamic Pairing Code API (Always Fresh)
 app.get('/api/pair', async (req, res) => {
-    if (isConnected) {
-        return res.json({ connected: true, message: 'WhatsApp is already connected!' });
-    }
-    if (currentPairingCode) {
-        return res.json({ connected: false, pairingCode: currentPairingCode, phone: CONFIG.FOUNDER_PHONE });
-    }
-    if (sock && !sock.authState.creds.registered) {
-        try {
-            const code = await sock.requestPairingCode(CONFIG.FOUNDER_PHONE);
-            currentPairingCode = code;
-            return res.json({ connected: false, pairingCode: code, phone: CONFIG.FOUNDER_PHONE });
-        } catch (e) {
-            return res.status(500).json({ error: e.message });
-        }
-    }
-    res.json({ connected: false, message: 'Pairing engine initializing. Refresh in 3 seconds.' });
+    const force = req.query.refresh === 'true' || req.query.refresh === '1';
+    const result = await getOrGeneratePairingCode(force);
+    res.json(result);
 });
 
 // Founder Desk Status
@@ -231,10 +304,8 @@ app.post('/api/desk/send', async (req, res) => {
     const cleanEmail = userEmail || 'Not Provided';
     const shortId = userId.slice(0, 8);
 
-    // Track active user
     lastActiveUserId = userId;
 
-    // Initialize conversation in store if not present
     if (!conversationStore.has(userId)) {
         conversationStore.set(userId, {
             user: { name: cleanName, email: cleanEmail, avatar: userAvatar || '' },
@@ -247,7 +318,6 @@ app.post('/api/desk/send', async (req, res) => {
     conv.user.name = cleanName;
     conv.user.email = cleanEmail;
 
-    // Append visitor message to history
     const userMsgObj = {
         id: `msg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
         sender: 'user',
@@ -295,7 +365,6 @@ _(Commands: .leave | .offline | .active)_`;
     }
 
     if (deskMode === 'OFFLINE') {
-        // Instant response in visitor's language
         console.log(`🌙 [OFFLINE MODE]: Generating instant Aira 3 Ultra response for ${cleanName}...`);
         queryAiraUltra(cleanName, cleanMsg, conv.messages).then(async (aiReply) => {
             const aiMsgObj = {
@@ -307,7 +376,6 @@ _(Commands: .leave | .offline | .active)_`;
             };
             conv.messages.push(aiMsgObj);
 
-            // Notify Boss on WhatsApp
             if (isConnected && sock) {
                 const founderJid = `${CONFIG.FOUNDER_PHONE}@s.whatsapp.net`;
                 const notify = await sock.sendMessage(founderJid, {
@@ -317,7 +385,6 @@ _(Commands: .leave | .offline | .active)_`;
             }
         });
     } else {
-        // ACTIVE MODE: Exactly 60 seconds timer as Boss requested
         conv.pendingTimer = setTimeout(async () => {
             console.log(`⏱️ [60s Timer Expired]: Founder hasn't replied. Aira 3 Ultra stepping in for ${cleanName}...`);
             try {
@@ -331,7 +398,6 @@ _(Commands: .leave | .offline | .active)_`;
                 };
                 conv.messages.push(aiMsgObj);
 
-                // Notify Founder on WhatsApp that Aira 3 Ultra responded
                 if (isConnected && sock) {
                     const founderJid = `${CONFIG.FOUNDER_PHONE}@s.whatsapp.net`;
                     const notifyText = 
@@ -388,10 +454,11 @@ app.get('/api/desk/history', (req, res) => {
     });
 });
 
-// Render Status Dashboard UI
-app.get('/', (req, res) => {
+// Render Dynamic Executive Dashboard UI
+app.get('/', async (req, res) => {
     const statusColor = isConnected ? '#10b981' : '#f59e0b';
     const statusText = isConnected ? `WhatsApp Connected (${deskMode} Mode)` : 'Waiting for WhatsApp Pairing';
+    const pairInfo = await getOrGeneratePairingCode(false);
 
     res.send(`
 <!DOCTYPE html>
@@ -401,39 +468,60 @@ app.get('/', (req, res) => {
   <title>Aira Founder Desk & WhatsApp Relay</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0a2342; color: #fff; margin: 0; padding: 24px; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
-    .card { background: #122b49; border: 1px solid rgba(255,255,255,0.1); border-radius: 20px; max-width: 520px; width: 100%; padding: 32px; box-shadow: 0 20px 50px rgba(0,0,0,0.5); }
-    .badge { display: inline-flex; align-items: center; gap: 8px; padding: 6px 14px; border-radius: 100px; font-size: 13px; font-weight: 600; background: rgba(255,255,255,0.08); margin-bottom: 20px; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0a2342; color: #fff; margin: 0; padding: 20px; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+    .card { background: #122b49; border: 1px solid rgba(255,255,255,0.1); border-radius: 20px; max-width: 540px; width: 100%; padding: 28px; box-shadow: 0 20px 50px rgba(0,0,0,0.5); text-align: center; }
+    .badge { display: inline-flex; align-items: center; gap: 8px; padding: 6px 14px; border-radius: 100px; font-size: 13px; font-weight: 600; background: rgba(255,255,255,0.08); margin-bottom: 16px; }
     .dot { width: 10px; height: 10px; border-radius: 50%; background: ${statusColor}; }
-    h1 { margin: 0 0 8px 0; font-size: 24px; font-weight: 700; }
-    p { color: #94a3b8; font-size: 14px; line-height: 1.6; margin: 0 0 20px 0; }
-    .pair-box { background: #07172b; border: 2px dashed #3b82f6; border-radius: 14px; padding: 20px; text-align: center; margin-bottom: 20px; }
-    .pair-code { font-family: monospace; font-size: 32px; font-weight: 800; letter-spacing: 4px; color: #38bdf8; user-select: all; }
-    .step { display: flex; gap: 12px; margin-bottom: 12px; font-size: 13px; color: #cbd5e1; text-align: left; }
-    .step-num { width: 22px; height: 22px; border-radius: 50%; background: #2563eb; display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-size: 12px; font-weight: bold; }
-    .btn { display: inline-block; background: #2563eb; color: #fff; text-decoration: none; padding: 12px 24px; border-radius: 10px; font-weight: 600; font-size: 14px; cursor: pointer; border: none; }
+    h1 { margin: 0 0 6px 0; font-size: 22px; font-weight: 700; }
+    p { color: #94a3b8; font-size: 13px; line-height: 1.5; margin: 0 0 20px 0; }
+    .pair-box { background: #07172b; border: 2px dashed #3b82f6; border-radius: 14px; padding: 18px; margin-bottom: 20px; }
+    .pair-code { font-family: monospace; font-size: 34px; font-weight: 800; letter-spacing: 5px; color: #38bdf8; user-select: all; cursor: pointer; }
+    .pair-timer { font-size: 11px; color: #fbbf24; margin-top: 6px; font-weight: 600; }
+    .step { display: flex; gap: 10px; margin-bottom: 10px; font-size: 12.5px; color: #cbd5e1; text-align: left; }
+    .step-num { width: 22px; height: 22px; border-radius: 50%; background: #2563eb; display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-size: 11px; font-weight: bold; }
+    .btn-row { display: flex; gap: 10px; justify-content: center; margin-top: 15px; }
+    .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; background: #2563eb; color: #fff; text-decoration: none; padding: 10px 20px; border-radius: 10px; font-weight: 600; font-size: 13px; cursor: pointer; border: none; transition: all 0.2s; }
+    .btn:hover { background: #1d4ed8; transform: translateY(-1px); }
+    .btn-secondary { background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.2); }
+    .btn-secondary:hover { background: rgba(255,255,255,0.18); }
+    .qr-container { margin: 20px 0; background: #fff; padding: 12px; border-radius: 12px; display: inline-block; }
+    .qr-container img { width: 170px; height: 170px; display: block; }
   </style>
 </head>
 <body>
   <div class="card">
-    <div class="badge"><span class="dot"></span> ${statusText}</div>
+    <div class="badge"><span class="dot"></span> <span id="status-text">${statusText}</span></div>
     <h1>Er. Adam Eehan • Direct Desk</h1>
     <p>Aira Group WhatsApp Linked Device Bridge & Sovereign AI Co-Pilot Server.</p>
 
     ${!isConnected ? `
     <div class="pair-box">
-      <div style="font-size: 12px; text-transform: uppercase; letter-spacing: 1.5px; color: #94a3b8; margin-bottom: 8px;">WhatsApp 8-Digit Pairing Code</div>
-      <div class="pair-code" id="code-val">${currentPairingCode || 'GENERATING...'}</div>
-      <div style="font-size: 12px; color: #64748b; margin-top: 8px;">Target Phone: +${CONFIG.FOUNDER_PHONE}</div>
+      <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 1.5px; color: #94a3b8; margin-bottom: 6px;">WhatsApp 8-Digit Pairing Code</div>
+      <div class="pair-code" id="pair-code-val" onclick="copyCode()" title="Click to copy">${pairInfo.pairingCode || 'LOADING...'}</div>
+      <div class="pair-timer" id="timer-val">Code valid • Auto-refreshes when expired</div>
+      <div style="font-size: 11px; color: #64748b; margin-top: 6px;">Target Phone: +${CONFIG.FOUNDER_PHONE}</div>
     </div>
 
-    <div style="margin-bottom: 24px;">
+    <div style="margin-bottom: 18px;">
       <div class="step"><div class="step-num">1</div><div>Open WhatsApp on Boss's Phone (+91 8921 584 368)</div></div>
       <div class="step"><div class="step-num">2</div><div>Tap <b>Menu (⋮)</b> or <b>Settings</b> &rarr; <b>Linked Devices</b></div></div>
       <div class="step"><div class="step-num">3</div><div>Tap <b>Link a Device</b> &rarr; <b>Link with phone number instead</b></div></div>
-      <div class="step"><div class="step-num">4</div><div>Enter the 8-digit code shown above to connect!</div></div>
+      <div class="step"><div class="step-num">4</div><div>Enter the 8-digit code shown above!</div></div>
     </div>
-    <button class="btn" onclick="location.reload()">Refresh Status</button>
+
+    ${pairInfo.qr ? `
+    <div style="margin-top: 15px; border-top: 1px solid rgba(255,255,255,0.1); pt: 15px;">
+      <div style="font-size: 12px; color: #94a3b8; margin-bottom: 8px;">Or Scan QR Code with WhatsApp:</div>
+      <div class="qr-container">
+        <img src="${pairInfo.qr}" alt="WhatsApp QR Code" />
+      </div>
+    </div>
+    ` : ''}
+
+    <div class="btn-row">
+      <button class="btn" onclick="copyCode()">📋 Copy Code</button>
+      <button class="btn btn-secondary" onclick="generateFreshCode()">⚡ Generate Fresh Code</button>
+    </div>
     ` : `
     <div style="background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: 12px; padding: 16px; margin-bottom: 20px;">
       <div style="color: #34d399; font-weight: 600; font-size: 15px; margin-bottom: 4px;">✓ WhatsApp Connected to +${CONFIG.FOUNDER_PHONE}</div>
@@ -444,6 +532,51 @@ app.get('/', (req, res) => {
     </div>
     `}
   </div>
+
+  <script>
+    function copyCode() {
+      const code = document.getElementById("pair-code-val")?.innerText;
+      if (code && code.length >= 8) {
+        navigator.clipboard.writeText(code).then(() => {
+          alert("✓ Code copied to clipboard: " + code);
+        }).catch(() => {
+          alert("Code: " + code);
+        });
+      }
+    }
+
+    async function generateFreshCode() {
+      const el = document.getElementById("pair-code-val");
+      const timer = document.getElementById("timer-val");
+      if (el) el.innerText = "REFRESHING...";
+      try {
+        const res = await fetch("/api/pair?refresh=true");
+        const data = await res.json();
+        if (data.pairingCode) {
+          if (el) el.innerText = data.pairingCode;
+          if (timer) timer.innerText = "Fresh code active! (120s)";
+        }
+      } catch (e) {
+        if (el) el.innerText = "RETRY";
+      }
+    }
+
+    // Auto-refresh code if still pairing
+    setInterval(async () => {
+      try {
+        const res = await fetch("/api/pair");
+        const data = await res.json();
+        if (data.connected) {
+          location.reload();
+        } else if (data.pairingCode) {
+          const el = document.getElementById("pair-code-val");
+          if (el && el.innerText !== data.pairingCode && data.pairingCode !== "LOADING...") {
+            el.innerText = data.pairingCode;
+          }
+        }
+      } catch (e) {}
+    }, 15000);
+  </script>
 </body>
 </html>
     `);
@@ -452,7 +585,7 @@ app.get('/', (req, res) => {
 // Start Express Server
 app.listen(CONFIG.PORT, () => {
     console.log(`\n======================================================`);
-    console.log(`🚀 AIRA FOUNDER DESK & WHATSAPP BRIDGE v2.0`);
+    console.log(`🚀 AIRA FOUNDER DESK & WHATSAPP BRIDGE v2.1`);
     console.log(`📡 Server listening on port: ${CONFIG.PORT}`);
     console.log(`👨‍💻 Founder: Er. Adam Eehan (+${CONFIG.FOUNDER_PHONE})`);
     console.log(`🤖 Desk Mode: ${deskMode} (Active Timeout: ${CONFIG.ACTIVE_TIMEOUT_MS / 1000}s)`);
@@ -488,27 +621,14 @@ async function startWhatsAppBridge() {
 
     sock.ev.on('creds.update', saveCreds);
 
-    // Auto-request pairing code if session is not yet registered
-    if (!sock.authState.creds.registered && !pairingRequested) {
-        pairingRequested = true;
-        setTimeout(async () => {
-            try {
-                console.log(`📲 Requesting 8-digit pairing code for +${CONFIG.FOUNDER_PHONE}...`);
-                const code = await sock.requestPairingCode(CONFIG.FOUNDER_PHONE);
-                currentPairingCode = code;
-                console.log('\n' + '='.repeat(50));
-                console.log(`🔑 WHATSAPP 8-DIGIT PAIRING CODE: ${code}`);
-                console.log(`👉 Open WhatsApp -> Linked Devices -> Link with phone number`);
-                console.log('='.repeat(50) + '\n');
-            } catch (err) {
-                console.error(`❌ Pairing code request error: ${err.message}`);
-                pairingRequested = false;
-            }
-        }, 5000);
-    }
-
     sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update;
+        const { connection, lastDisconnect, qr } = update;
+
+        if (qr) {
+            try {
+                currentQrDataUrl = await QRCode.toDataURL(qr);
+            } catch (e) {}
+        }
 
         if (connection === 'close') {
             isConnected = false;
@@ -523,6 +643,7 @@ async function startWhatsAppBridge() {
         } else if (connection === 'open') {
             isConnected = true;
             currentPairingCode = null;
+            currentQrDataUrl = null;
             console.log('\n' + '*'.repeat(55));
             console.log('✅ AIRA FOUNDER DESK CONNECTED TO WHATSAPP!');
             console.log(`📱 Founder Phone: +${CONFIG.FOUNDER_PHONE}`);
@@ -547,13 +668,11 @@ async function startWhatsAppBridge() {
             const senderJid = msg.key.remoteJid;
             if (senderJid === 'status@broadcast') continue;
 
-            // Cache message for decrypt retries
             if (msg.key?.id) cacheMessage(msg.key.id, msg.message);
 
             const isFromBoss = msg.key.fromMe || senderJid?.includes(CONFIG.FOUNDER_PHONE) || msg.key.participant?.includes(CONFIG.FOUNDER_PHONE);
             if (!isFromBoss) continue;
 
-            // Extract message text
             const rawText = msg.message?.conversation ||
                             msg.message?.extendedTextMessage?.text ||
                             msg.message?.imageMessage?.caption || '';
@@ -561,10 +680,6 @@ async function startWhatsAppBridge() {
             if (!text) continue;
 
             console.log(`📩 [Boss Message]: "${text}"`);
-
-            // ----------------------------------------------------
-            // 🛠️ BOSS ADMIN COMMANDS
-            // ----------------------------------------------------
 
             // Command: .leave
             if (text === '.leave' || text.startsWith('.leave ')) {
@@ -646,9 +761,7 @@ async function startWhatsAppBridge() {
                 continue;
             }
 
-            // ----------------------------------------------------
-            // 💬 DIRECT FOUNDER REPLY TO VISITOR
-            // ----------------------------------------------------
+            // Direct Founder Reply to Visitor
             const stanzaId = msg.message?.extendedTextMessage?.contextInfo?.stanzaId;
             let targetUserId = null;
             let targetUserName = null;
@@ -668,7 +781,6 @@ async function startWhatsAppBridge() {
                     }
                 }
             } else if (lastActiveUserId && conversationStore.has(lastActiveUserId)) {
-                // Natural typing fallback: If Boss just sends a message in chat, route to the active visitor!
                 targetUserId = lastActiveUserId;
                 targetUserName = conversationStore.get(lastActiveUserId)?.user?.name;
             }
@@ -676,7 +788,6 @@ async function startWhatsAppBridge() {
             if (targetUserId && conversationStore.has(targetUserId)) {
                 const conv = conversationStore.get(targetUserId);
 
-                // Cancel pending 60s AI fallback timer because Boss replied!
                 if (conv.pendingTimer) {
                     clearTimeout(conv.pendingTimer);
                     conv.pendingTimer = null;
@@ -684,7 +795,6 @@ async function startWhatsAppBridge() {
 
                 const cleanReply = text.startsWith('.reply ') ? text.split(' ').slice(2).join(' ') : text;
 
-                // Push Founder reply into conversation
                 const founderMsgObj = {
                     id: `founder_${Date.now()}`,
                     sender: 'founder',
@@ -697,7 +807,6 @@ async function startWhatsAppBridge() {
                 console.log(`\n👑 [Founder Replied via WhatsApp] To: ${targetUserName} [${targetUserId.slice(0, 8)}]`);
                 console.log(`💬 Reply: "${cleanReply}"`);
 
-                // React with checkmark on WhatsApp to confirm delivery to website
                 try {
                     await sock.sendMessage(senderJid, { react: { text: '✅', key: msg.key } });
                 } catch (e) {}
